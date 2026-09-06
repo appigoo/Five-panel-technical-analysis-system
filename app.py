@@ -218,6 +218,12 @@ def detect_patterns(d):
     # 【新增5】高品質紅K：紅K反轉訊號 + 同時主力籌碼正在上升 (單獨出現的紅K意義較弱)
     d["red_candle_with_accum"] = (d["candle_cat"] == "red_signal") & (d["whale_slope20"] > 0.3)
 
+    # 【新增6】強勢突破買入訊號：價格突破近20根K棒的前高(整理區間壓力) + 主力籌碼同步持續上升
+    # 對應「連續突破前高、伴隨鯨魚積累、順勢加碼」的多段式趨勢延續買入邏輯
+    prior_high_20 = d["High"].rolling(20).max().shift(1)
+    breakout_new_high = d["Close"] > prior_high_20
+    d["breakout_with_accumulation"] = breakout_new_high & (d["whale_slope20"] > 0.3)
+
     return d
 
 
@@ -364,6 +370,7 @@ def build_chart(d, ticker, momentum_levels=None):
         "red_candle_with_accum": ("高品質紅K(主力同步吸籌)", "star", "#ff1744", d["Low"] * 0.90),
         "key_level_breakout": ("突破關鍵位(買入確認)", "triangle-up", "#ffd54f", d["Low"] * 0.88),
         "internal_confirmed_signal": ("內部人買超+看漲K線同步", "star", "#ffab00", d["Low"] * 0.86),
+        "breakout_with_accumulation": ("強勢突破買入(突破前高+主力吸籌)", "arrow-up", "#00e676", d["Low"] * 0.84),
     }
     for col, (label, symbol, color, ypos) in pattern_style.items():
         mask = d[col].fillna(False)
@@ -463,6 +470,7 @@ def verdict_table(d):
         "key_level_breakout": ("突破關鍵位(買入確認)", "價格站上關鍵動能位，較單純測試更可靠的買入確認"),
         "mid_term_hold_signal": ("中期持有訊號", "主力籌碼持續增加且超過散戶，適合續抱"),
         "internal_confirmed_signal": ("內部人買超+看漲K線同步", "真實SEC Form 4申報買進，比技術代理指標更直接的確認"),
+        "breakout_with_accumulation": ("強勢突破買入", "價格突破近20根K棒前高，且主力籌碼同步持續上升，可順勢加碼"),
     }
     for col, (label, rule) in pattern_labels.items():
         occurred = d[col].fillna(False)
@@ -550,6 +558,8 @@ def generate_call(d):
         score += 3; reasons.append("近期出現「內部人真實買進+看漲K線」同步，屬最高等級確認訊號")
     elif "insider_buy" in recent.columns and recent["insider_buy"].fillna(False).any():
         score += 1; reasons.append("近期有內部人買進申報，但未與看漲K線同步，訊號強度中等")
+    if recent["breakout_with_accumulation"].fillna(False).any():
+        score += 3; reasons.append("近期出現「突破前高+主力籌碼同步上升」強勢突破買入訊號，可順勢加碼")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -576,6 +586,7 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         "key_level_breakout": "突破關鍵位(買入確認)",
         "mid_term_hold_signal": "中期持有訊號(主力籌碼持續增加)",
         "internal_confirmed_signal": "內部人買超+看漲K線同步(最高等級確認)",
+        "breakout_with_accumulation": "強勢突破買入(突破前高+主力吸籌)",
     }
     pattern_lines = []
     for col, label in pattern_labels.items():
@@ -642,7 +653,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -10 ~ +21，正值偏多、負值偏空）
+綜合評分：{score}（區間 -10 ~ +24，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -676,7 +687,7 @@ if ticker:
         call, score, reasons, price = generate_call(d)
         st.subheader("🎯 綜合判讀結論")
         st.markdown(f"### {call}")
-        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +21)**")
+        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +24)**")
         st.markdown("**判讀依據：**")
         for r in reasons:
             st.markdown(f"- {r}")
