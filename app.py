@@ -224,6 +224,19 @@ def detect_patterns(d):
     breakout_new_high = d["Close"] > prior_high_20
     d["breakout_with_accumulation"] = breakout_new_high & (d["whale_slope20"] > 0.3)
 
+    # 【新增7】吸籌區間 (Accumulation Zone)：波動性凹陷後，價格橫盤整理但主力籌碼持續上升，
+    # 對應「不追高殺低，區間內持續吸籌，讓時間發揮作用」的長線持有邏輯
+    def slope10(s):
+        y = s.values
+        if np.isnan(y).any():
+            return np.nan
+        return np.polyfit(np.arange(len(y)), y, 1)[0]
+
+    range10_pct = (d["High"].rolling(10).max() - d["Low"].rolling(10).min()) / d["Close"]
+    whale_slope10 = d["whale_pct"].rolling(10).apply(slope10, raw=False)
+    dist_from_high60 = (d["High"].rolling(60).max() - d["Close"]) / d["High"].rolling(60).max()
+    d["accumulation_zone"] = (range10_pct < 0.15) & (whale_slope10 > 0.2) & (dist_from_high60 > 0.15)
+
     return d
 
 
@@ -293,6 +306,23 @@ COLOR_MAP = {
 }
 
 
+def boolean_segments(mask):
+    """把布林序列依連續True切成 (start_idx, end_idx) 區段清單"""
+    segs = []
+    in_seg = False
+    start = None
+    vals = mask.fillna(False).values
+    for i, v in enumerate(vals):
+        if v and not in_seg:
+            start, in_seg = i, True
+        elif not v and in_seg:
+            segs.append((start, i - 1))
+            in_seg = False
+    if in_seg:
+        segs.append((start, len(vals) - 1))
+    return segs
+
+
 def build_chart(d, ticker, momentum_levels=None):
     fig = make_subplots(
         rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.02,
@@ -315,6 +345,22 @@ def build_chart(d, ticker, momentum_levels=None):
             fillcolor="rgba(255,0,0,0.25)" if up else "rgba(30,100,255,0.25)",
             line=dict(width=0), showlegend=False, hoverinfo="skip"
         ), row=1, col=1)
+
+    # --- 吸籌區間 (Accumulation Zone)：波動性凹陷後橫盤但主力持續買進的區段 ---
+    for s, e in boolean_segments(d["accumulation_zone"]):
+        if e - s < 2:  # 太短的區段(<3根K棒)不標示，避免雜訊
+            continue
+        zone = d.iloc[s:e + 1]
+        fig.add_vrect(
+            x0=zone.index[0], x1=zone.index[-1],
+            fillcolor="rgba(0, 230, 118, 0.12)", line_width=1, line_color="rgba(0,230,118,0.4)",
+            row=1, col=1
+        )
+        fig.add_annotation(
+            x=zone.index[len(zone) // 2], y=zone["High"].max() * 1.03,
+            text=f"吸籌區間 ${zone['Low'].min():,.1f}–${zone['High'].max():,.1f}",
+            showarrow=False, font=dict(color="#00e676", size=10), row=1, col=1
+        )
 
     # --- 費氏均線扇形 (對應原圖中收斂/發散的多線交叉區，用於標示賣出訊號/築底) ---
     fib_periods = [3, 5, 8, 13, 21, 34, 55, 89]
@@ -471,6 +517,7 @@ def verdict_table(d):
         "mid_term_hold_signal": ("中期持有訊號", "主力籌碼持續增加且超過散戶，適合續抱"),
         "internal_confirmed_signal": ("內部人買超+看漲K線同步", "真實SEC Form 4申報買進，比技術代理指標更直接的確認"),
         "breakout_with_accumulation": ("強勢突破買入", "價格突破近20根K棒前高，且主力籌碼同步持續上升，可順勢加碼"),
+        "accumulation_zone": ("吸籌區間", "波動性凹陷後橫盤整理但主力持續買進，適合區間內持有不追高殺低"),
     }
     for col, (label, rule) in pattern_labels.items():
         occurred = d[col].fillna(False)
@@ -560,6 +607,8 @@ def generate_call(d):
         score += 1; reasons.append("近期有內部人買進申報，但未與看漲K線同步，訊號強度中等")
     if recent["breakout_with_accumulation"].fillna(False).any():
         score += 3; reasons.append("近期出現「突破前高+主力籌碼同步上升」強勢突破買入訊號，可順勢加碼")
+    if last["accumulation_zone"]:
+        score += 1; reasons.append("目前處於「吸籌區間」(橫盤整理+主力持續買進)，建議耐心持有、不追高殺低")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -587,6 +636,7 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         "mid_term_hold_signal": "中期持有訊號(主力籌碼持續增加)",
         "internal_confirmed_signal": "內部人買超+看漲K線同步(最高等級確認)",
         "breakout_with_accumulation": "強勢突破買入(突破前高+主力吸籌)",
+        "accumulation_zone": "吸籌區間(橫盤整理+主力持續買進，建議持有)",
     }
     pattern_lines = []
     for col, label in pattern_labels.items():
@@ -653,7 +703,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -10 ~ +24，正值偏多、負值偏空）
+綜合評分：{score}（區間 -10 ~ +25，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -687,7 +737,7 @@ if ticker:
         call, score, reasons, price = generate_call(d)
         st.subheader("🎯 綜合判讀結論")
         st.markdown(f"### {call}")
-        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +24)**")
+        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +25)**")
         st.markdown("**判讀依據：**")
         for r in reasons:
             st.markdown(f"- {r}")
