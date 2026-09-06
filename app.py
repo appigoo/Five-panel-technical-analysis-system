@@ -150,6 +150,12 @@ def detect_patterns(d):
     future_gain = d["Close"].shift(-3) / d["Close"] - 1
     d["bullish_before_surge"] = (d["candle_cat"] == "red_signal") & (future_gain > 0.03)
 
+    # 【新增】即時強勢紅K訊號：只用當下可得資料，不看未來，可用於盤中即時判斷
+    # 條件：紅K反轉訊號 + 爆量(>1.3倍均量) + 收盤落在當日高低區間的上緣(強勢收盤)
+    close_position = (d["Close"] - d["Low"]) / (d["High"] - d["Low"]).replace(0, np.nan)
+    strong_close = close_position >= 0.7
+    d["realtime_bullish_signal"] = (d["candle_cat"] == "red_signal") & vol_spike & strong_close
+
     return d
 
 
@@ -228,7 +234,8 @@ def build_chart(d, ticker):
         "sell_signal": ("賣出訊號", "circle-open", "#ffd400", d["High"] * 1.02),
         "volatility_hole": ("波動性凹陷(築底)", "circle-open", "#00e5ff", d["Low"] * 0.98),
         "trend_reversal_candle": ("趨勢反轉燭", "diamond-open", "#ff9100", d["High"] * 1.04),
-        "bullish_before_surge": ("急漲前紅K", "star-open", "#ff3b3b", d["Low"] * 0.95),
+        "bullish_before_surge": ("急漲前紅K(回顧用)", "star-open", "#ff3b3b", d["Low"] * 0.95),
+        "realtime_bullish_signal": ("即時強勢紅K", "triangle-up-open", "#76ff03", d["Low"] * 0.92),
     }
     for col, (label, symbol, color, ypos) in pattern_style.items():
         mask = d[col].fillna(False)
@@ -300,16 +307,19 @@ def verdict_table(d):
     rows.append(["RSI(9/14/24)", f"{last['rsi9']:.1f} / {last['rsi14']:.1f} / {last['rsi24']:.1f}", "20-30超賣；80-95超買"])
 
     pattern_labels = {
-        "sell_signal": "賣出訊號", "volatility_hole": "波動性凹陷(築底)",
-        "trend_reversal_candle": "趨勢反轉燭", "bullish_before_surge": "急漲前紅K",
+        "sell_signal": ("賣出訊號", "高檔均線糾結收斂"),
+        "volatility_hole": ("波動性凹陷(築底)", "低檔波動急縮"),
+        "trend_reversal_candle": ("趨勢反轉燭", "爆量長K棒方向反轉"),
+        "bullish_before_surge": ("急漲前紅K(回顧用)", "⚠️用未來資料標註，僅供歷史回顧學習"),
+        "realtime_bullish_signal": ("即時強勢紅K", "紅K反轉+爆量+強勢收盤，可即時使用"),
     }
-    for col, label in pattern_labels.items():
+    for col, (label, rule) in pattern_labels.items():
         occurred = d[col].fillna(False)
         if occurred.any():
             bars_ago = len(d) - 1 - np.where(occurred.values)[0][-1]
-            rows.append([label, f"最近一次：{bars_ago} 根K棒前", "型態出現代表對應轉折/警示區"])
+            rows.append([label, f"最近一次：{bars_ago} 根K棒前", rule])
         else:
-            rows.append([label, "近期無", "型態出現代表對應轉折/警示區"])
+            rows.append([label, "近期無", rule])
 
     return pd.DataFrame(rows, columns=["指標", "目前數值", "判讀規則"])
 
@@ -363,6 +373,8 @@ def generate_call(d):
             score += 2; reasons.append("近期出現偏多方向的趨勢反轉燭")
         else:
             score -= 2; reasons.append("近期出現偏空方向的趨勢反轉燭")
+    if recent["realtime_bullish_signal"].fillna(False).any():
+        score += 1; reasons.append(f"近{lookback}根K棒內出現「即時強勢紅K」(反轉+爆量+強勢收盤)")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -382,7 +394,8 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
 
     pattern_labels = {
         "sell_signal": "賣出訊號", "volatility_hole": "波動性凹陷(築底)",
-        "trend_reversal_candle": "趨勢反轉燭", "bullish_before_surge": "急漲前紅K",
+        "trend_reversal_candle": "趨勢反轉燭", "bullish_before_surge": "急漲前紅K(回顧用，用未來資料標註)",
+        "realtime_bullish_signal": "即時強勢紅K(可即時使用)",
     }
     pattern_lines = []
     for col, label in pattern_labels.items():
@@ -437,7 +450,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -10 ~ +11，正值偏多、負值偏空）
+綜合評分：{score}（區間 -10 ~ +12，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -462,7 +475,7 @@ if ticker:
         call, score, reasons, price = generate_call(d)
         st.subheader("🎯 綜合判讀結論")
         st.markdown(f"### {call}")
-        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +11)**")
+        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +12)**")
         st.markdown("**判讀依據：**")
         for r in reasons:
             st.markdown(f"- {r}")
