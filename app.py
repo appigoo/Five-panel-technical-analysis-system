@@ -375,6 +375,76 @@ def generate_call(d):
     return call, score, reasons, price
 
 
+def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, price):
+    """組合成一段結構化文字，讓使用者可複製貼給任何AI大模型(ChatGPT/Claude/Gemini等)進一步分析"""
+    last = d.iloc[-1]
+    date_str = str(d.index[-1].date())
+
+    pattern_labels = {
+        "sell_signal": "賣出訊號", "volatility_hole": "波動性凹陷(築底)",
+        "trend_reversal_candle": "趨勢反轉燭", "bullish_before_surge": "急漲前紅K",
+    }
+    pattern_lines = []
+    for col, label in pattern_labels.items():
+        occurred = d[col].fillna(False)
+        if occurred.any():
+            bars_ago = len(d) - 1 - np.where(occurred.values)[0][-1]
+            pattern_lines.append(f"- {label}：最近一次出現在 {bars_ago} 根K棒前")
+        else:
+            pattern_lines.append(f"- {label}：近期未出現")
+
+    candle_cat_zh = {
+        "red_signal": "紅K(看漲反轉訊號)", "yellow_signal": "黃K(看跌反轉訊號)",
+        "darkblue_cont": "深藍K(漲勢延續)", "lightblue_cont": "淺藍K(跌勢延續)",
+    }.get(last["candle_cat"], last["candle_cat"])
+
+    prompt = f"""你是一位專業的股票技術分析師，請根據以下由多面板技術分析系統計算出的數據，
+針對「{ticker}」給我你的獨立判斷與操作建議。請特別評估目前系統給出的判讀是否合理，
+如果你有不同看法請直接指出並說明理由，最後請給我明確的多/空/中性結論與理由。
+
+【基本資訊】
+股票代碼：{ticker}
+資料日期：{date_str}
+K線週期：{interval_label}（資料範圍：{period}）
+現價：${price:,.2f}
+
+【面板1：K線形態 + 中期趨勢緞帶】
+今日K線分類：{candle_cat_zh}
+中期趨勢緞帶：{"紅色(多頭排列)" if last["ribbon_up"] else "藍色(空頭排列)"}
+短期均線：{last["MA_short"]:.2f}　中期均線：{last["MA_mid"]:.2f}
+
+【面板1 自動標註型態】
+{chr(10).join(pattern_lines)}
+
+【面板2：技術專家情緒指標】
+情緒強度值：{last["te_bar"]:.1f}（≥50為偏多情緒，<50為偏空情緒）
+
+【面板3：主力(鯨魚) vs 散戶 籌碼分佈】
+主力(鯨魚)佔比：{last["whale_pct"]:.1f}%（≥50%代表有撐，≥75%代表具備噴出動能）
+散戶佔比：{last["retail_pct"]:.1f}%（數值持續下降可能代表正在築底）
+短期買訊線：{last["whale_fast"]:.1f}　中期買訊線：{last["whale_slow"]:.1f}
+
+【面板4：MACD】
+DIF(快線)：{last["macd"]:.3f}
+DEA(慢線)：{last["macd_signal"]:.3f}
+MACD柱：{last["macd_hist"]:.3f}（>0代表柱翻紅偏多，<0代表柱翻綠偏空）
+
+【面板5：RSI】
+RSI(9)：{last["rsi9"]:.1f}
+RSI(14)：{last["rsi14"]:.1f}
+RSI(24)：{last["rsi24"]:.1f}
+（20-30為超賣區，80-95為超買區）
+
+【本系統目前的綜合判讀】
+結論：{call}
+綜合評分：{score}（區間 -10 ~ +11，正值偏多、負值偏空）
+判讀依據：
+{chr(10).join("- " + r for r in reasons)}
+
+請你根據以上數據，給出你自己的技術面分析、可能的風險點、以及你認為較合理的操作策略(進場點/停損點/目標價，若能給出具體數字更好)。"""
+    return prompt
+
+
 # ----------------------------- 主流程 -----------------------------
 if ticker:
     df = load_data(ticker, interval, period)
@@ -399,3 +469,8 @@ if ticker:
 
         st.info("⚠️ 本App所有『主力/散戶籌碼』與『技術專家情緒』面板為公開技術指標(MFI/隨機指標KD)之演算法代理，"
                 "非原軟體(GCAND/MCDX)的黑箱公式；判讀邏輯一致，數值僅供參考，非投資建議。")
+
+        st.subheader("🤖 AI 分析提示詞 (可複製貼給任何AI大模型)")
+        st.caption("將下方文字複製，貼到 ChatGPT / Claude / Gemini 等任何AI聊天視窗，即可請它針對本次讀值給出獨立判斷。")
+        ai_prompt = generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, price)
+        st.code(ai_prompt, language="text")
