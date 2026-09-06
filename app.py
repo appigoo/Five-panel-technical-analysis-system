@@ -156,6 +156,29 @@ def detect_patterns(d):
     strong_close = close_position >= 0.7
     d["realtime_bullish_signal"] = (d["candle_cat"] == "red_signal") & vol_spike & strong_close
 
+    # 【新增1】關鍵動能K棒壓力/支撐位：過去N根K棒內成交量最大的那根K棒的高點，視為關鍵價位
+    window = 40
+    key_level = []
+    vol_vals, high_vals = d["Volume"].values, d["High"].values
+    for i in range(len(d)):
+        lo = max(0, i - window + 1)
+        seg_vol = vol_vals[lo:i + 1]
+        idxmax = int(np.argmax(seg_vol))
+        key_level.append(high_vals[lo + idxmax])
+    d["key_level"] = key_level
+    d["near_key_level"] = (d["Close"] - d["key_level"]).abs() / d["key_level"] < 0.03
+
+    # 【新增2】中期持有訊號：主力(鯨魚)佔比持續上升(20根K棒斜率>0.5) 且已超過散戶佔比
+    def slope(s):
+        y = s.values
+        x = np.arange(len(y))
+        if np.isnan(y).any():
+            return np.nan
+        return np.polyfit(x, y, 1)[0]
+
+    d["whale_slope20"] = d["whale_pct"].rolling(20).apply(slope, raw=False)
+    d["mid_term_hold_signal"] = (d["whale_slope20"] > 0.5) & (d["whale_pct"] > d["retail_pct"])
+
     return d
 
 
@@ -216,6 +239,18 @@ def build_chart(d, ticker):
             name=f"EMA{n}", showlegend=False, hoverinfo="skip"
         ), row=1, col=1)
 
+    # --- 關鍵動能K棒壓力/支撐位 (過去40根K棒內最大量K棒的高點) ---
+    fig.add_trace(go.Scatter(
+        x=x, y=d["key_level"], mode="lines", name="關鍵動能壓力/支撐位",
+        line=dict(color="#40c4ff", width=1.2, dash="dot")
+    ), row=1, col=1)
+    near_mask = d["near_key_level"].fillna(False)
+    if near_mask.sum() > 0:
+        fig.add_trace(go.Scatter(
+            x=x[near_mask], y=d["key_level"][near_mask], mode="markers",
+            name="測試關鍵位", marker=dict(symbol="x", size=9, color="#40c4ff")
+        ), row=1, col=1)
+
     # --- 四色K線 (依分類遮罩) ---
     for cat, color in COLOR_MAP.items():
         mask = d["candle_cat"] == cat
@@ -265,6 +300,12 @@ def build_chart(d, ticker):
     fig.add_trace(go.Bar(x=x, y=d["daytrader_pct"], marker_color="#fbc02d", name="日內交易者%"), row=3, col=1)
     fig.add_trace(go.Scatter(x=x, y=d["whale_fast"], line=dict(color="#00e5ff", width=1.5), name="短期買訊線"), row=3, col=1)
     fig.add_trace(go.Scatter(x=x, y=d["whale_slow"], line=dict(color="#e040fb", width=1.5), name="中期買訊線"), row=3, col=1)
+    hold_mask = d["mid_term_hold_signal"].fillna(False)
+    if hold_mask.sum() > 0:
+        fig.add_trace(go.Scatter(
+            x=x[hold_mask], y=d["whale_pct"][hold_mask] + 3, mode="markers",
+            name="中期持有訊號", marker=dict(symbol="triangle-up", size=8, color="white")
+        ), row=3, col=1)
     fig.update_layout(barmode="stack")
     fig.add_hline(y=50, line_dash="dot", line_color="white", row=3, col=1)
     fig.add_hline(y=75, line_dash="dot", line_color="orange", row=3, col=1)
@@ -302,6 +343,8 @@ def verdict_table(d):
     rows.append(["中期趨勢緞帶", "紅(上漲)" if last["ribbon_up"] else "藍(下跌)", f"短均{last['MA_short']:.2f} vs 中均{last['MA_mid']:.2f}"])
     rows.append(["技術專家情緒", f"{last['te_bar']:.1f}", "≥50 看漲情緒／<50 看跌情緒"])
     rows.append(["主力(鯨魚)佔比", f"{last['whale_pct']:.1f}%", "≥50% 有撐；≥75% 具備噴出動能"])
+    rows.append(["主力籌碼斜率(20K棒)", f"{last['whale_slope20']:.2f}", ">0.5 代表主力持續加碼(籌碼翻紅趨勢)"])
+    rows.append(["關鍵動能位", f"${last['key_level']:.2f}", "近40根K棒最大量K棒高點，為壓力/支撐參考位"])
     rows.append(["散戶佔比", f"{last['retail_pct']:.1f}%", "數值持續下降＝可能正在築底"])
     rows.append(["MACD", f"DIF {last['macd']:.3f} / DEA {last['macd_signal']:.3f}", "DIF>DEA 且柱狀翻紅＝金叉看漲"])
     rows.append(["RSI(9/14/24)", f"{last['rsi9']:.1f} / {last['rsi14']:.1f} / {last['rsi24']:.1f}", "20-30超賣；80-95超買"])
@@ -312,6 +355,7 @@ def verdict_table(d):
         "trend_reversal_candle": ("趨勢反轉燭", "爆量長K棒方向反轉"),
         "bullish_before_surge": ("急漲前紅K(回顧用)", "⚠️用未來資料標註，僅供歷史回顧學習"),
         "realtime_bullish_signal": ("即時強勢紅K", "紅K反轉+爆量+強勢收盤，可即時使用"),
+        "mid_term_hold_signal": ("中期持有訊號", "主力籌碼持續增加且超過散戶，適合續抱"),
     }
     for col, (label, rule) in pattern_labels.items():
         occurred = d[col].fillna(False)
@@ -375,6 +419,11 @@ def generate_call(d):
             score -= 2; reasons.append("近期出現偏空方向的趨勢反轉燭")
     if recent["realtime_bullish_signal"].fillna(False).any():
         score += 1; reasons.append(f"近{lookback}根K棒內出現「即時強勢紅K」(反轉+爆量+強勢收盤)")
+    if last["mid_term_hold_signal"]:
+        score += 2; reasons.append(f"主力籌碼持續增加(斜率{last['whale_slope20']:.2f})且已超過散戶，屬「中期持有訊號」")
+    if last["near_key_level"]:
+        near_desc = "壓力" if last["Close"] < last["key_level"] else "支撐"
+        reasons.append(f"目前價格接近關鍵動能位 ${last['key_level']:.2f}，該處可能形成{near_desc}，留意反應")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -396,6 +445,7 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         "sell_signal": "賣出訊號", "volatility_hole": "波動性凹陷(築底)",
         "trend_reversal_candle": "趨勢反轉燭", "bullish_before_surge": "急漲前紅K(回顧用，用未來資料標註)",
         "realtime_bullish_signal": "即時強勢紅K(可即時使用)",
+        "mid_term_hold_signal": "中期持有訊號(主力籌碼持續增加)",
     }
     pattern_lines = []
     for col, label in pattern_labels.items():
@@ -425,6 +475,7 @@ K線週期：{interval_label}（資料範圍：{period}）
 今日K線分類：{candle_cat_zh}
 中期趨勢緞帶：{"紅色(多頭排列)" if last["ribbon_up"] else "藍色(空頭排列)"}
 短期均線：{last["MA_short"]:.2f}　中期均線：{last["MA_mid"]:.2f}
+關鍵動能壓力/支撐位：${last["key_level"]:.2f}（近40根K棒最大量K棒高點；{"目前正在測試此關鍵位" if last["near_key_level"] else "目前價格未接近此關鍵位"}）
 
 【面板1 自動標註型態】
 {chr(10).join(pattern_lines)}
@@ -434,6 +485,7 @@ K線週期：{interval_label}（資料範圍：{period}）
 
 【面板3：主力(鯨魚) vs 散戶 籌碼分佈】
 主力(鯨魚)佔比：{last["whale_pct"]:.1f}%（≥50%代表有撐，≥75%代表具備噴出動能）
+主力籌碼20K棒斜率：{last["whale_slope20"]:.2f}（>0.5代表主力持續加碼，籌碼正從散戶翻向主力）
 散戶佔比：{last["retail_pct"]:.1f}%（數值持續下降可能代表正在築底）
 短期買訊線：{last["whale_fast"]:.1f}　中期買訊線：{last["whale_slow"]:.1f}
 
@@ -450,7 +502,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -10 ~ +12，正值偏多、負值偏空）
+綜合評分：{score}（區間 -10 ~ +14，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -475,7 +527,7 @@ if ticker:
         call, score, reasons, price = generate_call(d)
         st.subheader("🎯 綜合判讀結論")
         st.markdown(f"### {call}")
-        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +12)**")
+        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +14)**")
         st.markdown("**判讀依據：**")
         for r in reasons:
             st.markdown(f"- {r}")
