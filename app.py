@@ -179,7 +179,33 @@ def detect_patterns(d):
     d["whale_slope20"] = d["whale_pct"].rolling(20).apply(slope, raw=False)
     d["mid_term_hold_signal"] = (d["whale_slope20"] > 0.5) & (d["whale_pct"] > d["retail_pct"])
 
+    # 【新增3】波動性凹陷(高品質版)：凹陷發生前，緞帶必須是持續下降的藍色緞帶 (至少近15根K棒中60%為藍)
+    pre_descending_ribbon = (~d["ribbon_up"]).shift(1).rolling(15).mean() >= 0.6
+    d["volatility_hole_confirmed"] = d["volatility_hole"] & pre_descending_ribbon.fillna(False)
+
+    # 【新增4】關鍵動能位突破確認：收盤價由下方站上關鍵動能位 (真正的買入確認訊號，而非只是測試)
+    prev_close, prev_key = d["Close"].shift(1), d["key_level"].shift(1)
+    d["key_level_breakout"] = (d["Close"] > d["key_level"]) & (prev_close <= prev_key)
+
+    # 【新增5】高品質紅K：紅K反轉訊號 + 同時主力籌碼正在上升 (單獨出現的紅K意義較弱)
+    d["red_candle_with_accum"] = (d["candle_cat"] == "red_signal") & (d["whale_slope20"] > 0.3)
+
     return d
+
+
+def find_momentum_levels(d, vol_window=60, top_pct=0.8, min_gap_pct=0.03):
+    """找出歷史上『關鍵動能K棒』的價位清單(結構性標記，非即時訊號)，
+    用於預測下一個/下下個潛在阻力目標，對應作者解讀中的 $161.60→$193→$203 邏輯。"""
+    swing_high = d["High"] == d["High"].rolling(11, center=True).max()
+    vol_rank = d["Volume"].rolling(vol_window, min_periods=20).apply(
+        lambda s: (s.iloc[-1] >= s).mean(), raw=False)
+    is_momentum_bar = swing_high.fillna(False) & (vol_rank >= top_pct).fillna(False)
+    levels = sorted(d.loc[is_momentum_bar, "High"].unique())
+    deduped = []
+    for lv in levels:
+        if not deduped or (lv - deduped[-1]) / deduped[-1] > min_gap_pct:
+            deduped.append(lv)
+    return deduped
 
 
 def ribbon_segments(d):
@@ -207,7 +233,7 @@ COLOR_MAP = {
 }
 
 
-def build_chart(d, ticker):
+def build_chart(d, ticker, momentum_levels=None):
     fig = make_subplots(
         rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.02,
         row_heights=[0.36, 0.14, 0.16, 0.16, 0.18],
@@ -251,6 +277,15 @@ def build_chart(d, ticker):
             name="測試關鍵位", marker=dict(symbol="x", size=9, color="#40c4ff")
         ), row=1, col=1)
 
+    # --- 未來動能目標價位 (作者解讀邏輯：突破後依序挑戰下一個歷史動能K棒高點) ---
+    if momentum_levels:
+        last_price = d["Close"].iloc[-1]
+        upcoming = [lv for lv in momentum_levels if lv > last_price][:3]
+        for lv in upcoming:
+            fig.add_hline(y=lv, line_dash="dash", line_color="#ffd54f", row=1, col=1,
+                          annotation_text=f"目標 ${lv:,.2f}", annotation_position="right",
+                          annotation_font=dict(color="#ffd54f", size=10))
+
     # --- 四色K線 (依分類遮罩) ---
     for cat, color in COLOR_MAP.items():
         mask = d["candle_cat"] == cat
@@ -264,13 +299,16 @@ def build_chart(d, ticker):
             name=cat, showlegend=True
         ), row=1, col=1)
 
-    # --- 面板1：四種型態標註 (賣出訊號/波動性凹陷/趨勢反轉燭/急漲前紅K) ---
+    # --- 面板1：型態標註 ---
     pattern_style = {
         "sell_signal": ("賣出訊號", "circle-open", "#ffd400", d["High"] * 1.02),
-        "volatility_hole": ("波動性凹陷(築底)", "circle-open", "#00e5ff", d["Low"] * 0.98),
+        "volatility_hole": ("波動性凹陷", "circle-open", "#00e5ff", d["Low"] * 0.98),
+        "volatility_hole_confirmed": ("波動性凹陷(高品質築底)", "circle", "#00e5ff", d["Low"] * 0.94),
         "trend_reversal_candle": ("趨勢反轉燭", "diamond-open", "#ff9100", d["High"] * 1.04),
         "bullish_before_surge": ("急漲前紅K(回顧用)", "star-open", "#ff3b3b", d["Low"] * 0.95),
         "realtime_bullish_signal": ("即時強勢紅K", "triangle-up-open", "#76ff03", d["Low"] * 0.92),
+        "red_candle_with_accum": ("高品質紅K(主力同步吸籌)", "star", "#ff1744", d["Low"] * 0.90),
+        "key_level_breakout": ("突破關鍵位(買入確認)", "triangle-up", "#ffd54f", d["Low"] * 0.88),
     }
     for col, (label, symbol, color, ypos) in pattern_style.items():
         mask = d[col].fillna(False)
@@ -351,10 +389,13 @@ def verdict_table(d):
 
     pattern_labels = {
         "sell_signal": ("賣出訊號", "高檔均線糾結收斂"),
-        "volatility_hole": ("波動性凹陷(築底)", "低檔波動急縮"),
+        "volatility_hole": ("波動性凹陷", "低檔波動急縮"),
+        "volatility_hole_confirmed": ("波動性凹陷(高品質築底)", "凹陷前需搭配持續下降的藍色緞帶，才是高品質築底訊號"),
         "trend_reversal_candle": ("趨勢反轉燭", "爆量長K棒方向反轉"),
         "bullish_before_surge": ("急漲前紅K(回顧用)", "⚠️用未來資料標註，僅供歷史回顧學習"),
         "realtime_bullish_signal": ("即時強勢紅K", "紅K反轉+爆量+強勢收盤，可即時使用"),
+        "red_candle_with_accum": ("高品質紅K", "紅K反轉+主力籌碼同步上升，單獨出現的紅K意義較弱"),
+        "key_level_breakout": ("突破關鍵位(買入確認)", "價格站上關鍵動能位，較單純測試更可靠的買入確認"),
         "mid_term_hold_signal": ("中期持有訊號", "主力籌碼持續增加且超過散戶，適合續抱"),
     }
     for col, (label, rule) in pattern_labels.items():
@@ -378,8 +419,13 @@ def generate_call(d):
     else:
         score -= 1; reasons.append("中期緞帶為藍（空頭排列）")
 
-    if last["candle_cat"] in ("red_signal", "darkblue_cont"):
-        score += 1; reasons.append("K線屬多頭類別")
+    if last["candle_cat"] == "red_signal":
+        if last["whale_slope20"] > 0.3:
+            score += 2; reasons.append("K線為紅K反轉，且主力籌碼同步上升 → 高品質訊號")
+        else:
+            score += 0; reasons.append("K線為紅K反轉，但主力籌碼未同步上升 → 單獨出現，訊號較弱")
+    elif last["candle_cat"] == "darkblue_cont":
+        score += 1; reasons.append("K線屬多頭延續類別")
     else:
         score -= 1; reasons.append("K線屬空頭類別")
 
@@ -409,7 +455,9 @@ def generate_call(d):
     recent = d.iloc[-lookback:]
     if recent["sell_signal"].fillna(False).any():
         score -= 2; reasons.append(f"近{lookback}根K棒內出現「賣出訊號」(高檔均線糾結)")
-    if recent["volatility_hole"].fillna(False).any():
+    if recent["volatility_hole_confirmed"].fillna(False).any():
+        score += 3; reasons.append(f"近{lookback}根K棒內出現「波動性凹陷+下降藍緞帶」高品質築底訊號")
+    elif recent["volatility_hole"].fillna(False).any():
         score += 2; reasons.append(f"近{lookback}根K棒內出現「波動性凹陷」(低檔築底特徵)")
     if recent["trend_reversal_candle"].fillna(False).any():
         rc = recent[recent["trend_reversal_candle"].fillna(False)].iloc[-1]
@@ -424,6 +472,8 @@ def generate_call(d):
     if last["near_key_level"]:
         near_desc = "壓力" if last["Close"] < last["key_level"] else "支撐"
         reasons.append(f"目前價格接近關鍵動能位 ${last['key_level']:.2f}，該處可能形成{near_desc}，留意反應")
+    if recent["key_level_breakout"].fillna(False).any():
+        score += 2; reasons.append(f"近{lookback}根K棒內站上關鍵動能位 ${last['key_level']:.2f} → 買入確認訊號")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -436,15 +486,18 @@ def generate_call(d):
     return call, score, reasons, price
 
 
-def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, price):
+def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, price, momentum_levels=None):
     """組合成一段結構化文字，讓使用者可複製貼給任何AI大模型(ChatGPT/Claude/Gemini等)進一步分析"""
     last = d.iloc[-1]
     date_str = str(d.index[-1].date())
 
     pattern_labels = {
-        "sell_signal": "賣出訊號", "volatility_hole": "波動性凹陷(築底)",
+        "sell_signal": "賣出訊號", "volatility_hole": "波動性凹陷",
+        "volatility_hole_confirmed": "波動性凹陷+下降藍緞帶(高品質築底)",
         "trend_reversal_candle": "趨勢反轉燭", "bullish_before_surge": "急漲前紅K(回顧用，用未來資料標註)",
         "realtime_bullish_signal": "即時強勢紅K(可即時使用)",
+        "red_candle_with_accum": "高品質紅K(紅K+主力籌碼同步上升)",
+        "key_level_breakout": "突破關鍵位(買入確認)",
         "mid_term_hold_signal": "中期持有訊號(主力籌碼持續增加)",
     }
     pattern_lines = []
@@ -461,6 +514,12 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         "darkblue_cont": "深藍K(漲勢延續)", "lightblue_cont": "淺藍K(跌勢延續)",
     }.get(last["candle_cat"], last["candle_cat"])
 
+    targets_text = "無明確歷史動能位資料"
+    if momentum_levels:
+        upcoming = [lv for lv in momentum_levels if lv > price][:3]
+        if upcoming:
+            targets_text = " → ".join(f"${lv:,.2f}" for lv in upcoming)
+
     prompt = f"""你是一位專業的股票技術分析師，請根據以下由多面板技術分析系統計算出的數據，
 針對「{ticker}」給我你的獨立判斷與操作建議。請特別評估目前系統給出的判讀是否合理，
 如果你有不同看法請直接指出並說明理由，最後請給我明確的多/空/中性結論與理由。
@@ -476,6 +535,7 @@ K線週期：{interval_label}（資料範圍：{period}）
 中期趨勢緞帶：{"紅色(多頭排列)" if last["ribbon_up"] else "藍色(空頭排列)"}
 短期均線：{last["MA_short"]:.2f}　中期均線：{last["MA_mid"]:.2f}
 關鍵動能壓力/支撐位：${last["key_level"]:.2f}（近40根K棒最大量K棒高點；{"目前正在測試此關鍵位" if last["near_key_level"] else "目前價格未接近此關鍵位"}）
+突破後潛在動能目標序列：{targets_text}
 
 【面板1 自動標註型態】
 {chr(10).join(pattern_lines)}
@@ -502,7 +562,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -10 ~ +14，正值偏多、負值偏空）
+綜合評分：{score}（區間 -10 ~ +18，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -518,7 +578,8 @@ if ticker:
     else:
         d = compute_all(df, short_ma, mid_ma)
         d = detect_patterns(d)
-        fig = build_chart(d, ticker)
+        momentum_levels = find_momentum_levels(d)
+        fig = build_chart(d, ticker, momentum_levels)
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("📋 當前讀值總表")
@@ -527,15 +588,20 @@ if ticker:
         call, score, reasons, price = generate_call(d)
         st.subheader("🎯 綜合判讀結論")
         st.markdown(f"### {call}")
-        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +14)**")
+        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +18)**")
         st.markdown("**判讀依據：**")
         for r in reasons:
             st.markdown(f"- {r}")
+
+        upcoming_targets = [lv for lv in momentum_levels if lv > price][:3]
+        if upcoming_targets:
+            st.markdown("**突破後潛在動能目標序列：** " + " → ".join(f"${lv:,.2f}" for lv in upcoming_targets))
+            st.caption("依歷史關鍵動能K棒高點由近到遠排列，僅供結構性參考，非保證價位。")
 
         st.info("⚠️ 本App所有『主力/散戶籌碼』與『技術專家情緒』面板為公開技術指標(MFI/隨機指標KD)之演算法代理，"
                 "非原軟體(GCAND/MCDX)的黑箱公式；判讀邏輯一致，數值僅供參考，非投資建議。")
 
         st.subheader("🤖 AI 分析提示詞 (可複製貼給任何AI大模型)")
         st.caption("將下方文字複製，貼到 ChatGPT / Claude / Gemini 等任何AI聊天視窗，即可請它針對本次讀值給出獨立判斷。")
-        ai_prompt = generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, price)
+        ai_prompt = generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, price, momentum_levels)
         st.code(ai_prompt, language="text")
