@@ -30,6 +30,7 @@ interval = interval_map[interval_label]
 period = st.sidebar.selectbox("資料範圍", ["1y", "2y", "5y", "10y", "max"], index=2)
 short_ma = st.sidebar.number_input("短期均線 (緞帶)", value=20, min_value=2)
 mid_ma = st.sidebar.number_input("中期均線 (緞帶)", value=60, min_value=3)
+show_insider = st.sidebar.checkbox("顯示內部人買超(Insider Buying)", value=True)
 run = st.sidebar.button("🔄 讀取資料", use_container_width=True)
 
 st.title("📊 五面板專業技術分析系統")
@@ -44,6 +45,33 @@ def load_data(tk, itv, per):
         df.columns = df.columns.get_level_values(0)
     df = df.dropna()
     return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_insider_buys(tk):
+    """抓取內部人(董監高)買進交易紀錄(SEC Form 4)。抓不到資料時回傳空表，不影響其他功能。"""
+    try:
+        t = yf.Ticker(tk)
+        raw = t.get_insider_transactions()
+        if raw is None or raw.empty:
+            return pd.DataFrame(columns=["Date", "Insider", "Position", "Shares", "Value"])
+        raw = raw.copy()
+        date_col = "Start Date" if "Start Date" in raw.columns else raw.columns[0]
+        raw["Date"] = pd.to_datetime(raw[date_col], errors="coerce")
+        trans_col = "Transaction" if "Transaction" in raw.columns else None
+        if trans_col:
+            is_buy = raw[trans_col].astype(str).str.contains("Purchase|Buy", case=False, na=False)
+            raw = raw[is_buy]
+        out = pd.DataFrame({
+            "Date": raw["Date"],
+            "Insider": raw.get("Insider", "未知"),
+            "Position": raw.get("Position", ""),
+            "Shares": raw.get("Shares", np.nan),
+            "Value": raw.get("Value", np.nan),
+        }).dropna(subset=["Date"]).sort_values("Date")
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["Date", "Insider", "Position", "Shares", "Value"])
 
 
 # ----------------------------- 指標計算 -----------------------------
@@ -208,6 +236,32 @@ def find_momentum_levels(d, vol_window=60, top_pct=0.8, min_gap_pct=0.03):
     return deduped
 
 
+def attach_insider_signals(d, insider_df, window_days=3):
+    """把內部人(董監高)買進紀錄對應到最接近的K棒，並判定是否與看漲K線同步出現(內部人確認訊號)"""
+    d = d.copy()
+    d["insider_buy"] = False
+    d["insider_buy_note"] = ""
+    if insider_df is None or insider_df.empty:
+        d["internal_confirmed_signal"] = False
+        return d
+
+    idx = d.index
+    for _, row in insider_df.iterrows():
+        buy_date = row["Date"]
+        if pd.isna(buy_date):
+            continue
+        diffs = np.abs((idx - buy_date).days)
+        min_i = int(diffs.argmin())
+        if diffs[min_i] <= window_days:
+            d.iloc[min_i, d.columns.get_loc("insider_buy")] = True
+            note = f"{row.get('Insider', '內部人')}買進"
+            existing = d.iloc[min_i, d.columns.get_loc("insider_buy_note")]
+            d.iloc[min_i, d.columns.get_loc("insider_buy_note")] = f"{existing}; {note}" if existing else note
+
+    d["internal_confirmed_signal"] = d["insider_buy"] & d["candle_cat"].isin(["red_signal", "darkblue_cont"])
+    return d
+
+
 def ribbon_segments(d):
     """把中期趨勢緞帶依連續同狀態切段，回傳每段 (index範圍, 是否上漲)"""
     segs = []
@@ -309,6 +363,7 @@ def build_chart(d, ticker, momentum_levels=None):
         "realtime_bullish_signal": ("即時強勢紅K", "triangle-up-open", "#76ff03", d["Low"] * 0.92),
         "red_candle_with_accum": ("高品質紅K(主力同步吸籌)", "star", "#ff1744", d["Low"] * 0.90),
         "key_level_breakout": ("突破關鍵位(買入確認)", "triangle-up", "#ffd54f", d["Low"] * 0.88),
+        "internal_confirmed_signal": ("內部人買超+看漲K線同步", "star", "#ffab00", d["Low"] * 0.86),
     }
     for col, (label, symbol, color, ypos) in pattern_style.items():
         mask = d[col].fillna(False)
@@ -324,6 +379,16 @@ def build_chart(d, ticker, momentum_levels=None):
             arrowhead=2, ax=0, ay=-30 if col in ("sell_signal", "trend_reversal_candle") else 30,
             font=dict(color=color, size=11), row=1, col=1
         )
+
+    # --- 內部人買超標記 (獨立於K線類別，只要有買進紀錄都標出) ---
+    insider_mask = d["insider_buy"].fillna(False) if "insider_buy" in d.columns else pd.Series(False, index=d.index)
+    if insider_mask.sum() > 0:
+        fig.add_trace(go.Scatter(
+            x=x[insider_mask], y=d["High"][insider_mask] * 1.06, mode="markers",
+            name="內部人買進申報(Form 4)", text=d["insider_buy_note"][insider_mask],
+            marker=dict(symbol="diamond", size=11, color="#00e676", line=dict(width=1, color="white")),
+            hovertemplate="%{text}<extra></extra>"
+        ), row=1, col=1)
 
     # --- 面板2：技術專家 (情緒柱 + 費氏均線扇形) ---
     bar_colors = np.where(d["te_bar"] >= 50, "#ff3b3b", "#00c853")
@@ -397,6 +462,7 @@ def verdict_table(d):
         "red_candle_with_accum": ("高品質紅K", "紅K反轉+主力籌碼同步上升，單獨出現的紅K意義較弱"),
         "key_level_breakout": ("突破關鍵位(買入確認)", "價格站上關鍵動能位，較單純測試更可靠的買入確認"),
         "mid_term_hold_signal": ("中期持有訊號", "主力籌碼持續增加且超過散戶，適合續抱"),
+        "internal_confirmed_signal": ("內部人買超+看漲K線同步", "真實SEC Form 4申報買進，比技術代理指標更直接的確認"),
     }
     for col, (label, rule) in pattern_labels.items():
         occurred = d[col].fillna(False)
@@ -405,6 +471,12 @@ def verdict_table(d):
             rows.append([label, f"最近一次：{bars_ago} 根K棒前", rule])
         else:
             rows.append([label, "近期無", rule])
+
+    if "insider_buy" in d.columns and d["insider_buy"].any():
+        bars_ago = len(d) - 1 - np.where(d["insider_buy"].fillna(False).values)[0][-1]
+        rows.append(["內部人買進(任何K線)", f"最近一次：{bars_ago} 根K棒前", "來自SEC Form 4申報，真實內部人交易紀錄"])
+    else:
+        rows.append(["內部人買進(任何K線)", "近期無 / 無資料", "來自SEC Form 4申報，真實內部人交易紀錄"])
 
     return pd.DataFrame(rows, columns=["指標", "目前數值", "判讀規則"])
 
@@ -474,6 +546,10 @@ def generate_call(d):
         reasons.append(f"目前價格接近關鍵動能位 ${last['key_level']:.2f}，該處可能形成{near_desc}，留意反應")
     if recent["key_level_breakout"].fillna(False).any():
         score += 2; reasons.append(f"近{lookback}根K棒內站上關鍵動能位 ${last['key_level']:.2f} → 買入確認訊號")
+    if "internal_confirmed_signal" in recent.columns and recent["internal_confirmed_signal"].fillna(False).any():
+        score += 3; reasons.append("近期出現「內部人真實買進+看漲K線」同步，屬最高等級確認訊號")
+    elif "insider_buy" in recent.columns and recent["insider_buy"].fillna(False).any():
+        score += 1; reasons.append("近期有內部人買進申報，但未與看漲K線同步，訊號強度中等")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -499,6 +575,7 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         "red_candle_with_accum": "高品質紅K(紅K+主力籌碼同步上升)",
         "key_level_breakout": "突破關鍵位(買入確認)",
         "mid_term_hold_signal": "中期持有訊號(主力籌碼持續增加)",
+        "internal_confirmed_signal": "內部人買超+看漲K線同步(最高等級確認)",
     }
     pattern_lines = []
     for col, label in pattern_labels.items():
@@ -540,6 +617,9 @@ K線週期：{interval_label}（資料範圍：{period}）
 【面板1 自動標註型態】
 {chr(10).join(pattern_lines)}
 
+【內部人買賣紀錄 (SEC Form 4，真實資料非技術代理指標)】
+{"近期有內部人買進：" + str(int(d["insider_buy"].tail(10).sum())) + " 筆(近10根K棒內)" if "insider_buy" in d.columns and d["insider_buy"].any() else "近期無內部人買進申報資料，或該股票查無公開Form 4紀錄"}
+
 【面板2：技術專家情緒指標】
 情緒強度值：{last["te_bar"]:.1f}（≥50為偏多情緒，<50為偏空情緒）
 
@@ -562,7 +642,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -10 ~ +18，正值偏多、負值偏空）
+綜合評分：{score}（區間 -10 ~ +21，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -578,9 +658,17 @@ if ticker:
     else:
         d = compute_all(df, short_ma, mid_ma)
         d = detect_patterns(d)
+        insider_df = load_insider_buys(ticker) if show_insider else pd.DataFrame(columns=["Date", "Insider", "Position", "Shares", "Value"])
+        d = attach_insider_signals(d, insider_df)
         momentum_levels = find_momentum_levels(d)
         fig = build_chart(d, ticker, momentum_levels)
         st.plotly_chart(fig, use_container_width=True)
+
+        if show_insider and not insider_df.empty:
+            with st.expander(f"🟢 內部人買進紀錄 (SEC Form 4，共{len(insider_df)}筆)"):
+                st.dataframe(insider_df, use_container_width=True, hide_index=True)
+        elif show_insider:
+            st.caption("ℹ️ 查無此股票的內部人買進公開紀錄(可能該公司近期無申報，或資料來源暫時無法取得)。")
 
         st.subheader("📋 當前讀值總表")
         st.dataframe(verdict_table(d), use_container_width=True, hide_index=True)
@@ -588,7 +676,7 @@ if ticker:
         call, score, reasons, price = generate_call(d)
         st.subheader("🎯 綜合判讀結論")
         st.markdown(f"### {call}")
-        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +18)**")
+        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +21)**")
         st.markdown("**判讀依據：**")
         for r in reasons:
             st.markdown(f"- {r}")
