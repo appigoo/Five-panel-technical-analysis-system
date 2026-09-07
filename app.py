@@ -785,27 +785,46 @@ with tab2:
                 sdf = load_data(tk, scan_interval, scan_period)
                 if sdf.empty or len(sdf) < 80:
                     results.append({"股票代碼": tk, "狀態": "資料不足或查無此代碼", "現價": None,
-                                     "波動性凹陷+下降藍緞帶": "-", "最近幾根K棒前": "-", "緞帶方向": "-", "主力佔比%": "-"})
+                                     "波動性凹陷+下降藍緞帶": "-", "最近幾根K棒前": "-", "緞帶方向": "-",
+                                     "主力佔比%": "-", "系統建議": "-", "評分": "-", "決策(不模稜兩可)": "-"})
                 else:
                     sd = compute_all(sdf, 20, 60)
                     sd = detect_patterns(sd)
+                    sd = attach_insider_signals(sd, pd.DataFrame(columns=["Date", "Insider", "Position", "Shares", "Value"]))
                     recent_s = sd.iloc[-scan_lookback:]
                     hit = recent_s["volatility_hole_confirmed"].fillna(False)
                     last_row = sd.iloc[-1]
+                    call_s, score_s, _, _ = generate_call(sd)
+
                     if hit.any():
                         bars_ago = scan_lookback - 1 - int(np.where(hit.values)[0][-1])
                         hit_text, bars_text = "✅ 符合", f"{bars_ago} 根K棒前"
+                        # 決定性建議：把「訊號有沒有觸發」+「緞帶是否已翻紅」+「主力是否過半」三個條件直接寫死成決策
+                        if last_row["ribbon_up"] and last_row["whale_pct"] >= 50:
+                            decision = "🟢 可正常倉位進場(緞帶已翻紅+主力過半)"
+                        else:
+                            missing = []
+                            if not last_row["ribbon_up"]:
+                                missing.append("緞帶未翻紅")
+                            if last_row["whale_pct"] < 50:
+                                missing.append("主力未過半")
+                            decision = f"🟡 僅建議小倉位試單，等{'/'.join(missing)}後再加碼"
                     else:
                         hit_text, bars_text = "—", "-"
+                        decision = "🔴 未觸發訊號，不建議進場"
+
                     results.append({
                         "股票代碼": tk, "狀態": "OK", "現價": round(float(last_row["Close"]), 2),
                         "波動性凹陷+下降藍緞帶": hit_text, "最近幾根K棒前": bars_text,
                         "緞帶方向": "紅(多頭)" if last_row["ribbon_up"] else "藍(空頭)",
                         "主力佔比%": round(float(last_row["whale_pct"]), 1),
+                        "系統建議": call_s, "評分": score_s,
+                        "決策(不模稜兩可)": decision,
                     })
             except Exception as e:
                 results.append({"股票代碼": tk, "狀態": f"錯誤: {e}", "現價": None,
-                                 "波動性凹陷+下降藍緞帶": "-", "最近幾根K棒前": "-", "緞帶方向": "-", "主力佔比%": "-"})
+                                 "波動性凹陷+下降藍緞帶": "-", "最近幾根K棒前": "-", "緞帶方向": "-",
+                                 "主力佔比%": "-", "系統建議": "-", "評分": "-", "決策(不模稜兩可)": "-"})
             progress.progress((i + 1) / len(tickers_to_scan), text=f"掃描中... {tk}")
         progress.empty()
 
