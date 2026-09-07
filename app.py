@@ -711,46 +711,114 @@ RSI(24)：{last["rsi24"]:.1f}
     return prompt
 
 
-# ----------------------------- 主流程 -----------------------------
-if ticker:
-    df = load_data(ticker, interval, period)
-    if df.empty:
-        st.error("查無資料，請確認代碼是否正確。")
-    else:
-        d = compute_all(df, short_ma, mid_ma)
-        d = detect_patterns(d)
-        insider_df = load_insider_buys(ticker) if show_insider else pd.DataFrame(columns=["Date", "Insider", "Position", "Shares", "Value"])
-        d = attach_insider_signals(d, insider_df)
-        momentum_levels = find_momentum_levels(d)
-        fig = build_chart(d, ticker, momentum_levels)
-        st.plotly_chart(fig, use_container_width=True)
 
-        if show_insider and not insider_df.empty:
-            with st.expander(f"🟢 內部人買進紀錄 (SEC Form 4，共{len(insider_df)}筆)"):
-                st.dataframe(insider_df, use_container_width=True, hide_index=True)
-        elif show_insider:
-            st.caption("ℹ️ 查無此股票的內部人買進公開紀錄(可能該公司近期無申報，或資料來源暫時無法取得)。")
+tab1, tab2 = st.tabs(["📊 單一股票分析", "🔍 批量掃描(尋找被市場忽略的機會)"])
 
-        st.subheader("📋 當前讀值總表")
-        st.dataframe(verdict_table(d), use_container_width=True, hide_index=True)
+with tab1:
+    # ----------------------------- 單一股票分析 -----------------------------
+    if ticker:
+        df = load_data(ticker, interval, period)
+        if df.empty:
+            st.error("查無資料，請確認代碼是否正確。")
+        else:
+            d = compute_all(df, short_ma, mid_ma)
+            d = detect_patterns(d)
+            insider_df = load_insider_buys(ticker) if show_insider else pd.DataFrame(columns=["Date", "Insider", "Position", "Shares", "Value"])
+            d = attach_insider_signals(d, insider_df)
+            momentum_levels = find_momentum_levels(d)
+            fig = build_chart(d, ticker, momentum_levels)
+            st.plotly_chart(fig, use_container_width=True)
 
-        call, score, reasons, price = generate_call(d)
-        st.subheader("🎯 綜合判讀結論")
-        st.markdown(f"### {call}")
-        st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +25)**")
-        st.markdown("**判讀依據：**")
-        for r in reasons:
-            st.markdown(f"- {r}")
+            if show_insider and not insider_df.empty:
+                with st.expander(f"🟢 內部人買進紀錄 (SEC Form 4，共{len(insider_df)}筆)"):
+                    st.dataframe(insider_df, use_container_width=True, hide_index=True)
+            elif show_insider:
+                st.caption("ℹ️ 查無此股票的內部人買進公開紀錄(可能該公司近期無申報，或資料來源暫時無法取得)。")
 
-        upcoming_targets = [lv for lv in momentum_levels if lv > price][:3]
-        if upcoming_targets:
-            st.markdown("**突破後潛在動能目標序列：** " + " → ".join(f"${lv:,.2f}" for lv in upcoming_targets))
-            st.caption("依歷史關鍵動能K棒高點由近到遠排列，僅供結構性參考，非保證價位。")
+            st.subheader("📋 當前讀值總表")
+            st.dataframe(verdict_table(d), use_container_width=True, hide_index=True)
 
-        st.info("⚠️ 本App所有『主力/散戶籌碼』與『技術專家情緒』面板為公開技術指標(MFI/隨機指標KD)之演算法代理，"
-                "非原軟體(GCAND/MCDX)的黑箱公式；判讀邏輯一致，數值僅供參考，非投資建議。")
+            call, score, reasons, price = generate_call(d)
+            st.subheader("🎯 綜合判讀結論")
+            st.markdown(f"### {call}")
+            st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +25)**")
+            st.markdown("**判讀依據：**")
+            for r in reasons:
+                st.markdown(f"- {r}")
 
-        st.subheader("🤖 AI 分析提示詞 (可複製貼給任何AI大模型)")
-        st.caption("將下方文字複製，貼到 ChatGPT / Claude / Gemini 等任何AI聊天視窗，即可請它針對本次讀值給出獨立判斷。")
-        ai_prompt = generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, price, momentum_levels)
-        st.code(ai_prompt, language="text")
+            upcoming_targets = [lv for lv in momentum_levels if lv > price][:3]
+            if upcoming_targets:
+                st.markdown("**突破後潛在動能目標序列：** " + " → ".join(f"${lv:,.2f}" for lv in upcoming_targets))
+                st.caption("依歷史關鍵動能K棒高點由近到遠排列，僅供結構性參考，非保證價位。")
+
+            st.info("⚠️ 本App所有『主力/散戶籌碼』與『技術專家情緒』面板為公開技術指標(MFI/隨機指標KD)之演算法代理，"
+                    "非原軟體(GCAND/MCDX)的黑箱公式；判讀邏輯一致，數值僅供參考，非投資建議。")
+
+            st.subheader("🤖 AI 分析提示詞 (可複製貼給任何AI大模型)")
+            st.caption("將下方文字複製，貼到 ChatGPT / Claude / Gemini 等任何AI聊天視窗，即可請它針對本次讀值給出獨立判斷。")
+            ai_prompt = generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, price, momentum_levels)
+            st.code(ai_prompt, language="text")
+
+
+with tab2:
+    # ----------------------------- 批量掃描：尋找被市場忽略的機會 -----------------------------
+    st.markdown("### 🔍 批量掃描「波動性凹陷 + 下降藍緞帶」高品質築底訊號")
+    st.caption("同時概念：符合此組合的股票，代表可能正處於「沒人想要它」的早期築底階段。輸入多檔股票代碼(逗號分隔)，一次掃描。")
+
+    watchlist_input = st.text_area(
+        "股票代碼清單 (逗號或換行分隔)",
+        value="AMD, ONDS, HOOD, PLTR, TSLA, VST, SPCX, DELL",
+        height=80,
+    )
+    scan_interval_label = st.selectbox("掃描週期", ["日線 (1d)", "週線 (1wk)", "月線 (1mo)"], index=1, key="scan_interval")
+    scan_interval = interval_map[scan_interval_label]
+    scan_period = st.selectbox("掃描資料範圍", ["1y", "2y", "5y", "10y"], index=2, key="scan_period")
+    scan_lookback = st.slider("掃描『最近幾根K棒內』出現過訊號", 1, 30, 10)
+    scan_btn = st.button("🚀 開始掃描", use_container_width=True)
+
+    if scan_btn:
+        tickers_to_scan = [t.strip().upper() for t in watchlist_input.replace("\n", ",").split(",") if t.strip()]
+        results = []
+        progress = st.progress(0.0, text="掃描中...")
+        for i, tk in enumerate(tickers_to_scan):
+            try:
+                sdf = load_data(tk, scan_interval, scan_period)
+                if sdf.empty or len(sdf) < 80:
+                    results.append({"股票代碼": tk, "狀態": "資料不足或查無此代碼", "現價": None,
+                                     "波動性凹陷+下降藍緞帶": "-", "最近幾根K棒前": "-", "緞帶方向": "-", "主力佔比%": "-"})
+                else:
+                    sd = compute_all(sdf, 20, 60)
+                    sd = detect_patterns(sd)
+                    recent_s = sd.iloc[-scan_lookback:]
+                    hit = recent_s["volatility_hole_confirmed"].fillna(False)
+                    last_row = sd.iloc[-1]
+                    if hit.any():
+                        bars_ago = scan_lookback - 1 - int(np.where(hit.values)[0][-1])
+                        hit_text, bars_text = "✅ 符合", f"{bars_ago} 根K棒前"
+                    else:
+                        hit_text, bars_text = "—", "-"
+                    results.append({
+                        "股票代碼": tk, "狀態": "OK", "現價": round(float(last_row["Close"]), 2),
+                        "波動性凹陷+下降藍緞帶": hit_text, "最近幾根K棒前": bars_text,
+                        "緞帶方向": "紅(多頭)" if last_row["ribbon_up"] else "藍(空頭)",
+                        "主力佔比%": round(float(last_row["whale_pct"]), 1),
+                    })
+            except Exception as e:
+                results.append({"股票代碼": tk, "狀態": f"錯誤: {e}", "現價": None,
+                                 "波動性凹陷+下降藍緞帶": "-", "最近幾根K棒前": "-", "緞帶方向": "-", "主力佔比%": "-"})
+            progress.progress((i + 1) / len(tickers_to_scan), text=f"掃描中... {tk}")
+        progress.empty()
+
+        result_df = pd.DataFrame(results)
+        hits_df = result_df[result_df["波動性凹陷+下降藍緞帶"] == "✅ 符合"]
+
+        if not hits_df.empty:
+            st.success(f"🎯 找到 {len(hits_df)} 檔符合「波動性凹陷+下降藍緞帶」高品質築底訊號的股票")
+            st.dataframe(hits_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("目前掃描清單中沒有股票符合此訊號組合，可以調整「最近幾根K棒內」範圍或更換股票清單再試。")
+
+        with st.expander("查看完整掃描結果(含未符合訊號的股票)"):
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+        st.caption("⚠️ 掃描結果為技術面公開指標之演算法計算，非財務建議；請自行進一步查證基本面與新聞面再做決策。")
