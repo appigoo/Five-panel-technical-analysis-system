@@ -237,6 +237,13 @@ def detect_patterns(d):
     dist_from_high60 = (d["High"].rolling(60).max() - d["Close"]) / d["High"].rolling(60).max()
     d["accumulation_zone"] = (range10_pct < 0.15) & (whale_slope10 > 0.2) & (dist_from_high60 > 0.15)
 
+    # 【新增8】支撐回測確認：價格曾站上關鍵動能位(突破)，之後回檔測試該位置但收盤仍守住 → 阻力翻支撐確認
+    # 比單純「站上關鍵位」更可靠：突破是第一步，回測不破才是真正的買入確認
+    was_above_key = d["Close"].shift(1) > d["key_level"].shift(1)
+    pulled_back_near_key = (d["Low"] - d["key_level"]).abs() / d["key_level"] < 0.03
+    held_above_key = d["Close"] > d["key_level"]
+    d["support_retest_confirmed"] = was_above_key & pulled_back_near_key & held_above_key
+
     return d
 
 
@@ -417,6 +424,7 @@ def build_chart(d, ticker, momentum_levels=None):
         "key_level_breakout": ("突破關鍵位(買入確認)", "triangle-up", "#ffd54f", d["Low"] * 0.88),
         "internal_confirmed_signal": ("內部人買超+看漲K線同步", "star", "#ffab00", d["Low"] * 0.86),
         "breakout_with_accumulation": ("強勢突破買入(突破前高+主力吸籌)", "arrow-up", "#00e676", d["Low"] * 0.84),
+        "support_retest_confirmed": ("支撐回測確認(阻力翻支撐)", "circle", "#40c4ff", d["Low"] * 0.82),
     }
     for col, (label, symbol, color, ypos) in pattern_style.items():
         mask = d[col].fillna(False)
@@ -518,6 +526,7 @@ def verdict_table(d):
         "internal_confirmed_signal": ("內部人買超+看漲K線同步", "真實SEC Form 4申報買進，比技術代理指標更直接的確認"),
         "breakout_with_accumulation": ("強勢突破買入", "價格突破近20根K棒前高，且主力籌碼同步持續上升，可順勢加碼"),
         "accumulation_zone": ("吸籌區間", "波動性凹陷後橫盤整理但主力持續買進，適合區間內持有不追高殺低"),
+        "support_retest_confirmed": ("支撐回測確認", "突破關鍵位後回測不破，比單純突破更可靠的買入確認(阻力翻支撐)"),
     }
     for col, (label, rule) in pattern_labels.items():
         occurred = d[col].fillna(False)
@@ -609,6 +618,8 @@ def generate_call(d):
         score += 3; reasons.append("近期出現「突破前高+主力籌碼同步上升」強勢突破買入訊號，可順勢加碼")
     if last["accumulation_zone"]:
         score += 1; reasons.append("目前處於「吸籌區間」(橫盤整理+主力持續買進)，建議耐心持有、不追高殺低")
+    if recent["support_retest_confirmed"].fillna(False).any():
+        score += 3; reasons.append("近期出現「突破關鍵位後回測不破」確認訊號，比單純突破更可靠，阻力已翻轉為支撐")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -637,6 +648,7 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         "internal_confirmed_signal": "內部人買超+看漲K線同步(最高等級確認)",
         "breakout_with_accumulation": "強勢突破買入(突破前高+主力吸籌)",
         "accumulation_zone": "吸籌區間(橫盤整理+主力持續買進，建議持有)",
+        "support_retest_confirmed": "支撐回測確認(阻力翻支撐)",
     }
     pattern_lines = []
     for col, label in pattern_labels.items():
@@ -703,7 +715,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -10 ~ +25，正值偏多、負值偏空）
+綜合評分：{score}（區間 -10 ~ +28，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -741,7 +753,7 @@ with tab1:
             call, score, reasons, price = generate_call(d)
             st.subheader("🎯 綜合判讀結論")
             st.markdown(f"### {call}")
-            st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +25)**")
+            st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +28)**")
             st.markdown("**判讀依據：**")
             for r in reasons:
                 st.markdown(f"- {r}")
@@ -767,7 +779,7 @@ with tab2:
 
     watchlist_input = st.text_area(
         "股票代碼清單 (逗號或換行分隔)",
-        value="AMD, ONDS, HOOD, PLTR, TSLA, VST, SPCX, DELL",
+        value="AMD, ONDS, HOOD, PLTR, TSLA, VST, SPCX, DELL, BE",
         height=80,
     )
     scan_interval_label = st.selectbox("掃描週期", ["日線 (1d)", "週線 (1wk)", "月線 (1mo)"], index=1, key="scan_interval")
