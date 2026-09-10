@@ -36,6 +36,32 @@ run = st.sidebar.button("🔄 讀取資料", use_container_width=True)
 st.title("📊 五面板專業技術分析系統")
 st.caption(f"{ticker} — {interval_label} — 範圍 {period}")
 
+with st.expander("📖 如何解讀本圖表 (新手必看)"):
+    st.markdown("""
+**跟著緞帶走，尊重K線顏色，留意那個凹洞！**
+
+**面板1：K線顏色**
+| 顏色 | 意義 |
+|---|---|
+| 🔴 紅K | 看漲反轉訊號(多頭起漲) |
+| 🔵 深藍K | 漲勢延續 |
+| 🟡 黃K | 看跌警訊 |
+| 🩵 淺藍K | 跌勢延續 |
+單一根紅黃K來回翻轉是雜訊，不用理會；只有連續3天收盤跌破緞帶下緣，才是真正的轉空訊號(緞帶跌破確認)。
+
+**面板1：中期趨勢緞帶**
+- 🔴 紅色緞帶 = 中期上升趨勢　🔵 藍色緞帶 = 中期下降趨勢
+- **波動性凹陷 + 正在下降的藍色緞帶** = 可能的底部/買入區（凹陷前緞帶需持續下降15根K棒中60%以上才算高品質）
+
+**面板1：關鍵動能位**
+近期最大量(或最長)的K棒高點，是關鍵支撐/壓力。一旦「堅定突破」，這個位置就從壓力翻轉成支撐；之後回測不破(支撐回測確認)比單純突破更可靠。
+
+**面板3：主力(鯨魚) vs 散戶**
+紅色柱狀(主力)持續上升 = 籌碼吸納力道變強，≥50%有撐、≥75%具備噴出動能。
+
+⚠️ 以上皆為技術面公開指標之演算法計算結果，非財務建議，請自行評估風險。
+""")
+
 
 # ----------------------------- 資料抓取 -----------------------------
 @st.cache_data(ttl=1800, show_spinner=True)
@@ -244,6 +270,11 @@ def detect_patterns(d):
     held_above_key = d["Close"] > d["key_level"]
     d["support_retest_confirmed"] = was_above_key & pulled_back_near_key & held_above_key
 
+    # 【新增9】緞帶跌破確認：紅黃K線交替是雜訊，只有連續3天收盤跌破緞帶下緣，才是真正的轉空/多頭論點失效訊號
+    ribbon_lower = pd.concat([d["MA_short"], d["MA_mid"]], axis=1).min(axis=1)
+    below_ribbon_lower = d["Close"] < ribbon_lower
+    d["ribbon_breakdown_confirmed"] = below_ribbon_lower.rolling(3).sum() >= 3
+
     return d
 
 
@@ -425,6 +456,7 @@ def build_chart(d, ticker, momentum_levels=None):
         "internal_confirmed_signal": ("內部人買超+看漲K線同步", "star", "#ffab00", d["Low"] * 0.86),
         "breakout_with_accumulation": ("強勢突破買入(突破前高+主力吸籌)", "arrow-up", "#00e676", d["Low"] * 0.84),
         "support_retest_confirmed": ("支撐回測確認(阻力翻支撐)", "circle", "#40c4ff", d["Low"] * 0.82),
+        "ribbon_breakdown_confirmed": ("緞帶跌破確認(多頭論點失效)", "x", "#d500f9", d["High"] * 1.08),
     }
     for col, (label, symbol, color, ypos) in pattern_style.items():
         mask = d[col].fillna(False)
@@ -527,6 +559,7 @@ def verdict_table(d):
         "breakout_with_accumulation": ("強勢突破買入", "價格突破近20根K棒前高，且主力籌碼同步持續上升，可順勢加碼"),
         "accumulation_zone": ("吸籌區間", "波動性凹陷後橫盤整理但主力持續買進，適合區間內持有不追高殺低"),
         "support_retest_confirmed": ("支撐回測確認", "突破關鍵位後回測不破，比單純突破更可靠的買入確認(阻力翻支撐)"),
+        "ribbon_breakdown_confirmed": ("緞帶跌破確認", "連續3天收盤跌破緞帶下緣，代表多頭論點失效；紅黃K線單獨交替是雜訊，不用理會"),
     }
     for col, (label, rule) in pattern_labels.items():
         occurred = d[col].fillna(False)
@@ -620,6 +653,8 @@ def generate_call(d):
         score += 1; reasons.append("目前處於「吸籌區間」(橫盤整理+主力持續買進)，建議耐心持有、不追高殺低")
     if recent["support_retest_confirmed"].fillna(False).any():
         score += 3; reasons.append("近期出現「突破關鍵位後回測不破」確認訊號，比單純突破更可靠，阻力已翻轉為支撐")
+    if recent["ribbon_breakdown_confirmed"].fillna(False).any():
+        score -= 4; reasons.append("⚠️ 連續3天收盤跌破緞帶下緣，多頭論點已失效，這不是紅黃K線交替的雜訊，是真正的轉空訊號")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -649,6 +684,7 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         "breakout_with_accumulation": "強勢突破買入(突破前高+主力吸籌)",
         "accumulation_zone": "吸籌區間(橫盤整理+主力持續買進，建議持有)",
         "support_retest_confirmed": "支撐回測確認(阻力翻支撐)",
+        "ribbon_breakdown_confirmed": "緞帶跌破確認(多頭論點失效，非紅黃K雜訊)",
     }
     pattern_lines = []
     for col, label in pattern_labels.items():
@@ -715,7 +751,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -10 ~ +28，正值偏多、負值偏空）
+綜合評分：{score}（區間 -14 ~ +28，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -753,7 +789,7 @@ with tab1:
             call, score, reasons, price = generate_call(d)
             st.subheader("🎯 綜合判讀結論")
             st.markdown(f"### {call}")
-            st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -10 ~ +28)**")
+            st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -14 ~ +28)**")
             st.markdown("**判讀依據：**")
             for r in reasons:
                 st.markdown(f"- {r}")
@@ -812,7 +848,9 @@ with tab2:
                         bars_ago = scan_lookback - 1 - int(np.where(hit.values)[0][-1])
                         hit_text, bars_text = "✅ 符合", f"{bars_ago} 根K棒前"
                         # 決定性建議：把「訊號有沒有觸發」+「緞帶是否已翻紅」+「主力是否過半」三個條件直接寫死成決策
-                        if last_row["ribbon_up"] and last_row["whale_pct"] >= 50:
+                        if recent_s["ribbon_breakdown_confirmed"].fillna(False).any():
+                            decision = "🔴 曾出現緞帶跌破確認，多頭論點已失效，不建議進場"
+                        elif last_row["ribbon_up"] and last_row["whale_pct"] >= 50:
                             decision = "🟢 可正常倉位進場(緞帶已翻紅+主力過半)"
                         else:
                             missing = []
