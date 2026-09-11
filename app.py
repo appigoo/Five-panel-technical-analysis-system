@@ -275,6 +275,24 @@ def detect_patterns(d):
     below_ribbon_lower = d["Close"] < ribbon_lower
     d["ribbon_breakdown_confirmed"] = below_ribbon_lower.rolling(3).sum() >= 3
 
+    # 【新增10】雙重波動性凹陷：近40根K棒內出現過兩次(以上)波動性凹陷，且價位相近(15%以內)
+    # 代表築底更紮實(類似雙底結構)，是比單一凹陷更強的訊號
+    def has_prior_similar_hole(mask, low_series, window=40, tol=0.15):
+        vals = mask.fillna(False).values
+        lows = low_series.values
+        out = np.zeros(len(vals), dtype=bool)
+        for i in range(len(vals)):
+            if not vals[i]:
+                continue
+            lo = max(0, i - window)
+            for j in range(lo, i):
+                if vals[j] and abs(lows[i] - lows[j]) / lows[j] < tol:
+                    out[i] = True
+                    break
+        return pd.Series(out, index=low_series.index)
+
+    d["dual_volatility_hole"] = has_prior_similar_hole(d["volatility_hole_confirmed"], d["Low"])
+
     return d
 
 
@@ -457,6 +475,7 @@ def build_chart(d, ticker, momentum_levels=None):
         "breakout_with_accumulation": ("強勢突破買入(突破前高+主力吸籌)", "arrow-up", "#00e676", d["Low"] * 0.84),
         "support_retest_confirmed": ("支撐回測確認(阻力翻支撐)", "circle", "#40c4ff", d["Low"] * 0.82),
         "ribbon_breakdown_confirmed": ("緞帶跌破確認(多頭論點失效)", "x", "#d500f9", d["High"] * 1.08),
+        "dual_volatility_hole": ("雙重波動性凹陷(築底更紮實)", "circle", "#18ffff", d["Low"] * 0.80),
     }
     for col, (label, symbol, color, ypos) in pattern_style.items():
         mask = d[col].fillna(False)
@@ -560,6 +579,7 @@ def verdict_table(d):
         "accumulation_zone": ("吸籌區間", "波動性凹陷後橫盤整理但主力持續買進，適合區間內持有不追高殺低"),
         "support_retest_confirmed": ("支撐回測確認", "突破關鍵位後回測不破，比單純突破更可靠的買入確認(阻力翻支撐)"),
         "ribbon_breakdown_confirmed": ("緞帶跌破確認", "連續3天收盤跌破緞帶下緣，代表多頭論點失效；紅黃K線單獨交替是雜訊，不用理會"),
+        "dual_volatility_hole": ("雙重波動性凹陷", "近40根K棒內出現兩次相近價位的波動性凹陷，築底結構更紮實，比單次凹陷更可靠"),
     }
     for col, (label, rule) in pattern_labels.items():
         occurred = d[col].fillna(False)
@@ -655,6 +675,8 @@ def generate_call(d):
         score += 3; reasons.append("近期出現「突破關鍵位後回測不破」確認訊號，比單純突破更可靠，阻力已翻轉為支撐")
     if recent["ribbon_breakdown_confirmed"].fillna(False).any():
         score -= 4; reasons.append("⚠️ 連續3天收盤跌破緞帶下緣，多頭論點已失效，這不是紅黃K線交替的雜訊，是真正的轉空訊號")
+    if recent["dual_volatility_hole"].fillna(False).any():
+        score += 2; reasons.append("近期出現「雙重波動性凹陷」，兩次相近價位的築底訊號疊加，結構比單次凹陷更紮實")
 
     if score >= 4:
         call = "🟢 偏多操作 — 順勢做多／逢回布局"
@@ -685,6 +707,7 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         "accumulation_zone": "吸籌區間(橫盤整理+主力持續買進，建議持有)",
         "support_retest_confirmed": "支撐回測確認(阻力翻支撐)",
         "ribbon_breakdown_confirmed": "緞帶跌破確認(多頭論點失效，非紅黃K雜訊)",
+        "dual_volatility_hole": "雙重波動性凹陷(築底更紮實)",
     }
     pattern_lines = []
     for col, label in pattern_labels.items():
@@ -751,7 +774,7 @@ RSI(24)：{last["rsi24"]:.1f}
 
 【本系統目前的綜合判讀】
 結論：{call}
-綜合評分：{score}（區間 -14 ~ +28，正值偏多、負值偏空）
+綜合評分：{score}（區間 -14 ~ +30，正值偏多、負值偏空）
 判讀依據：
 {chr(10).join("- " + r for r in reasons)}
 
@@ -789,7 +812,7 @@ with tab1:
             call, score, reasons, price = generate_call(d)
             st.subheader("🎯 綜合判讀結論")
             st.markdown(f"### {call}")
-            st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -14 ~ +28)**")
+            st.markdown(f"**現價：${price:,.2f}｜綜合評分：{score} (區間 -14 ~ +30)**")
             st.markdown("**判讀依據：**")
             for r in reasons:
                 st.markdown(f"- {r}")
