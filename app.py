@@ -362,6 +362,23 @@ COLOR_MAP = {
 }
 
 
+def support_levels_below(momentum_levels, price, n=2):
+    """價格下方最近的n個歷史動能位(由近到遠)，過去的壓力位被突破後翻轉為支撐"""
+    if not momentum_levels:
+        return []
+    return [lv for lv in momentum_levels if lv < price][::-1][:n]
+
+
+def ribbon_duration_info(d):
+    """回傳 (目前緞帶方向是否上漲, 目前這一段已持續幾根K棒, 先前同方向各段長度清單)"""
+    segs = ribbon_segments(d)
+    if not segs:
+        return None, 0, []
+    start, end, up = segs[-1]
+    prior = [e - s for s, e, u in segs[:-1] if u == up]
+    return up, end - start, prior
+
+
 def boolean_segments(mask):
     """把布林序列依連續True切成 (start_idx, end_idx) 區段清單"""
     segs = []
@@ -447,6 +464,13 @@ def build_chart(d, ticker, momentum_levels=None):
             fig.add_hline(y=lv, line_dash="dash", line_color="#ffd54f", row=1, col=1,
                           annotation_text=f"目標 ${lv:,.2f}", annotation_position="right",
                           annotation_font=dict(color="#ffd54f", size=10))
+
+    # --- 下方支撐位 (過去壓力位被突破後翻轉為支撐；偏空時是關鍵的防守參考) ---
+    if momentum_levels:
+        for lv in support_levels_below(momentum_levels, d["Close"].iloc[-1]):
+            fig.add_hline(y=lv, line_dash="dash", line_color="#69f0ae", row=1, col=1,
+                          annotation_text=f"支撐 ${lv:,.2f}", annotation_position="right",
+                          annotation_font=dict(color="#69f0ae", size=10))
 
     # --- 四色K線 (依分類遮罩) ---
     for cat, color in COLOR_MAP.items():
@@ -729,6 +753,15 @@ def generate_ai_prompt(d, ticker, interval_label, period, call, score, reasons, 
         if upcoming:
             targets_text = " → ".join(f"${lv:,.2f}" for lv in upcoming)
 
+    supports = support_levels_below(momentum_levels, price)
+    supports_text = " → ".join(f"${lv:,.2f}" for lv in supports) if supports else "價格下方無明確歷史動能位"
+    rib_up, rib_len, rib_prior = ribbon_duration_info(d)
+    if rib_up is None:
+        ribbon_dur_text = "無資料"
+    else:
+        prior_txt = "、".join(str(x) for x in rib_prior[-3:]) if rib_prior else "無先前紀錄"
+        ribbon_dur_text = f"目前{'紅' if rib_up else '藍'}緞帶已持續 {rib_len} 根K棒（先前同色緞帶各段長度：{prior_txt} 根）"
+
     prompt = f"""你是一位專業的股票技術分析師，請根據以下由多面板技術分析系統計算出的數據，
 針對「{ticker}」給我你的獨立判斷與操作建議。請特別評估目前系統給出的判讀是否合理，
 如果你有不同看法請直接指出並說明理由，最後請給我明確的多/空/中性結論與理由。
@@ -745,6 +778,8 @@ K線週期：{interval_label}（資料範圍：{period}）
 短期均線：{last["MA_short"]:.2f}　中期均線：{last["MA_mid"]:.2f}
 關鍵動能壓力/支撐位：${last["key_level"]:.2f}（近40根K棒最大量K棒高點；{"目前正在測試此關鍵位" if last["near_key_level"] else "目前價格未接近此關鍵位"}）
 突破後潛在動能目標序列：{targets_text}
+下方支撐位序列(由近到遠)：{supports_text}
+緞帶持續時間：{ribbon_dur_text}
 
 【面板1 自動標註型態】
 {chr(10).join(pattern_lines)}
@@ -821,6 +856,16 @@ with tab1:
             if upcoming_targets:
                 st.markdown("**突破後潛在動能目標序列：** " + " → ".join(f"${lv:,.2f}" for lv in upcoming_targets))
                 st.caption("依歷史關鍵動能K棒高點由近到遠排列，僅供結構性參考，非保證價位。")
+
+            lower_supports = support_levels_below(momentum_levels, price)
+            if lower_supports:
+                st.markdown("**下方支撐位序列(由近到遠)：** " + " → ".join(f"${lv:,.2f}" for lv in lower_supports))
+                st.caption("過去的動能壓力位被突破後翻轉為支撐；若跌破最近一層，下一層才是下個防守位。")
+
+            rib_up, rib_len, rib_prior = ribbon_duration_info(d)
+            if rib_up is not None:
+                prior_txt = "、".join(str(x) for x in rib_prior[-3:]) if rib_prior else "無先前紀錄"
+                st.markdown(f"**緞帶持續時間：** 目前{'🔴紅' if rib_up else '🔵藍'}緞帶已持續 {rib_len} 根K棒（先前同色各段：{prior_txt} 根）")
 
             st.info("⚠️ 本App所有『主力/散戶籌碼』與『技術專家情緒』面板為公開技術指標(MFI/隨機指標KD)之演算法代理，"
                     "非原軟體(GCAND/MCDX)的黑箱公式；判讀邏輯一致，數值僅供參考，非投資建議。")
