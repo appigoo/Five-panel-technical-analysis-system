@@ -236,6 +236,9 @@ def detect_patterns(d):
     # 【新增3】波動性凹陷(高品質版)：凹陷發生前，緞帶必須是持續下降的藍色緞帶 (至少近15根K棒中60%為藍)
     pre_descending_ribbon = (~d["ribbon_up"]).shift(1).rolling(15).mean() >= 0.6
     d["volatility_hole_confirmed"] = d["volatility_hole"] & pre_descending_ribbon.fillna(False)
+    d["flag_near_bottom"] = near_bottom.fillna(False)
+    d["flag_tight_range"] = tight_range.fillna(False)
+    d["flag_pre_desc_ribbon"] = pre_descending_ribbon.fillna(False)
 
     # 【新增4】關鍵動能位突破確認：收盤價由下方站上關鍵動能位 (真正的買入確認訊號，而非只是測試)
     prev_close, prev_key = d["Close"].shift(1), d["key_level"].shift(1)
@@ -273,7 +276,9 @@ def detect_patterns(d):
     # 【新增9】緞帶跌破確認：紅黃K線交替是雜訊，只有連續3天收盤跌破緞帶下緣，才是真正的轉空/多頭論點失效訊號
     ribbon_lower = pd.concat([d["MA_short"], d["MA_mid"]], axis=1).min(axis=1)
     below_ribbon_lower = d["Close"] < ribbon_lower
-    d["ribbon_breakdown_confirmed"] = below_ribbon_lower.rolling(3).sum() >= 3
+    # 只有「原本是紅(上升)緞帶」被連3日跌破才算轉空；已在藍緞帶下方的股票(築底候選)不該被重複判定為跌破
+    was_red_ribbon = d["ribbon_up"].shift(2).fillna(False).astype(bool)
+    d["ribbon_breakdown_confirmed"] = (below_ribbon_lower.rolling(3).sum() >= 3) & was_red_ribbon
 
     # 【新增10】雙重波動性凹陷：近40根K棒內出現過兩次(以上)波動性凹陷，且價位相近(15%以內)
     # 代表築底更紮實(類似雙底結構)，是比單一凹陷更強的訊號
@@ -818,6 +823,40 @@ RSI(24)：{last["rsi24"]:.1f}
 
 
 
+def scan_decision(sd, lookback, score):
+    """批量掃描的決定性建議。築底型(有波動性凹陷)與順勢型(無築底訊號)分開判斷，三種結論都可達成。"""
+    recent = sd.iloc[-lookback:]
+    last = sd.iloc[-1]
+    hit = recent["volatility_hole_confirmed"].fillna(False)
+    if hit.any():
+        hole_low = float(recent.loc[hit, "Low"].min())
+        if last["Close"] < hole_low:
+            return f"🔴 築底失敗：收盤已跌破凹陷低點 ${hole_low:,.2f}，不進場/出場"
+        ribbon_ok = bool(last["ribbon_up"]) or bool(recent["breakout_with_accumulation"].fillna(False).any())
+        whale_ok = last["whale_pct"] >= 50
+        if ribbon_ok and whale_ok:
+            return f"🟢 可正常倉位進場；停損設凹陷低點 ${hole_low:,.2f}"
+        missing = []
+        if not ribbon_ok:
+            missing.append("緞帶未翻紅")
+        if not whale_ok:
+            missing.append("主力未過半")
+        return f"🟡 僅小倉位試單，等{'/'.join(missing)}後再加碼；停損 ${hole_low:,.2f}"
+    if score >= 4:
+        return f"🟢 順勢型偏多(評分{score})，非築底訊號；可順勢持有/回測加碼"
+    if score <= -4:
+        return f"🔴 偏空(評分{score})，不進場"
+    return f"🟡 無築底訊號且評分{score}中性，觀望"
+
+
+def scan_diagnosis(sd, lookback):
+    """列出築底三條件在最近 lookback 根K棒內是否各自出現過，說明『為什麼沒觸發』"""
+    r = sd.iloc[-lookback:]
+    def mark(col):
+        return "✓" if r[col].fillna(False).any() else "✗"
+    return f"接近低點{mark('flag_near_bottom')} 波動壓縮{mark('flag_tight_range')} 下降藍緞帶{mark('flag_pre_desc_ribbon')}"
+
+
 tab1, tab2 = st.tabs(["📊 單一股票分析", "🔍 批量掃描(尋找被市場忽略的機會)"])
 
 with tab1:
@@ -915,21 +954,10 @@ with tab2:
                     if hit.any():
                         bars_ago = scan_lookback - 1 - int(np.where(hit.values)[0][-1])
                         hit_text, bars_text = "✅ 符合", f"{bars_ago} 根K棒前"
-                        # 決定性建議：把「訊號有沒有觸發」+「緞帶是否已翻紅」+「主力是否過半」三個條件直接寫死成決策
-                        if recent_s["ribbon_breakdown_confirmed"].fillna(False).any():
-                            decision = "🔴 曾出現緞帶跌破確認，多頭論點已失效，不建議進場"
-                        elif last_row["ribbon_up"] and last_row["whale_pct"] >= 50:
-                            decision = "🟢 可正常倉位進場(緞帶已翻紅+主力過半)"
-                        else:
-                            missing = []
-                            if not last_row["ribbon_up"]:
-                                missing.append("緞帶未翻紅")
-                            if last_row["whale_pct"] < 50:
-                                missing.append("主力未過半")
-                            decision = f"🟡 僅建議小倉位試單，等{'/'.join(missing)}後再加碼"
                     else:
                         hit_text, bars_text = "—", "-"
-                        decision = "🔴 未觸發訊號，不建議進場"
+                    decision = scan_decision(sd, scan_lookback, score_s)
+                    diagnosis = scan_diagnosis(sd, scan_lookback)
 
                     results.append({
                         "股票代碼": tk, "狀態": "OK", "現價": round(float(last_row["Close"]), 2),
@@ -937,6 +965,7 @@ with tab2:
                         "緞帶方向": "紅(多頭)" if last_row["ribbon_up"] else "藍(空頭)",
                         "主力佔比%": round(float(last_row["whale_pct"]), 1),
                         "系統建議": call_s, "評分": score_s,
+                        "築底條件檢查": diagnosis,
                         "決策(不模稜兩可)": decision,
                     })
             except Exception as e:
